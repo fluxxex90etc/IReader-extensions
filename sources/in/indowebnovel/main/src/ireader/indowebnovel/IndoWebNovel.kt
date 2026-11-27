@@ -86,7 +86,10 @@ abstract class IndoWebNovel(deps: Dependencies) : SourceFactory(
     override val contentFetcher: Content
         get() = SourceFactory.Content(
             pageTitleSelector = ".title-chapter",
-            pageContentSelector = ".readersss p",
+            // FIX 2026-11-27 (Shiawase): indowebnovel.id redesigned its chapter
+            // pages — the old ".readersss p" container no longer exists (0
+            // matches live). The story is now in <div id="content">.
+            pageContentSelector = "#content p",
         )
 
 }
