@@ -1,0 +1,180 @@
+name: Build Single Extension
+
+# Builds ONE IReader extension module (e.g. the fixed IndoWebNovel) and,
+# optionally, publishes it to a Shiawase catalog repo (IReader-type index).
+# This replaces upstream's build_push.yml (full-matrix build of all ~150
+# extensions) in the fork — do NOT re-enable build_push.yml / build_js.yml
+# here; they burn a full matrix run on every push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      module:
+        description: "Gradle module path, e.g. :extensions:individual:in:indowebnovel"
+        required: true
+        default: ":extensions:individual:in:indowebnovel"
+      catalog_repo:
+        description: "Catalog repo (owner/repo) to publish to; empty = build only, no publish"
+        required: false
+        default: "fluxxex90etc/shiawase-novel-repo"
+
+concurrency:
+  group: build-single
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build + sign
+    runs-on: ubuntu-latest
+    env:
+      # Same trick as upstream's prepare job: makes settings.gradle.kts take
+      # the include-all branch instead of the CI chunking branch (which would
+      # NPE without CI_CHUNK_SIZE / CI_CHUNK_NUM).
+      CI_MODULE_GEN: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: 21
+          distribution: adopt
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Set up Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Copy CI gradle.properties
+        run: |
+          mkdir -p ~/.gradle
+          cp .github/runner-files/ci-gradle.properties ~/.gradle/gradle.properties
+
+      - name: Decrypt signing keystore
+        env:
+          KEYSTORE_ENC_PASS: ${{ secrets.KEYSTORE_ENC_PASS }}
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in shiawase-extensions.keystore.enc \
+            -out "$RUNNER_TEMP/signingkey.p12" \
+            -pass env:KEYSTORE_ENC_PASS
+          ls -l "$RUNNER_TEMP/signingkey.p12"
+
+      - name: Build extension + repo index
+        run: ./gradlew ${{ inputs.module }}:assembleRelease repo
+
+      - name: Sign APK
+        env:
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ALIAS }}
+        run: |
+          TOOLS="$(ls -d ${ANDROID_HOME}/build-tools/* | tail -1)"
+          for APK in build/repo/apk/*.apk; do
+            echo "== $APK"
+            "$TOOLS/zipalign" -c -v -p 4 "$APK"
+            "$TOOLS/apksigner" sign \
+              --ks "$RUNNER_TEMP/signingkey.p12" --ks-type PKCS12 \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass env:KEY_STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+              "$APK"
+            "$TOOLS/apksigner" verify --verbose --print-certs "$APK"
+            "$TOOLS/aapt2" dump badging "$APK" | head -1
+          done
+
+      - name: Verify fixed selector in dex
+        run: |
+          for APK in build/repo/apk/*.apk; do
+            echo "== $APK"
+            if ! unzip -p "$APK" 'classes*.dex' | strings | grep -q -F '#content p'; then
+              echo "ERROR: fixed selector '#content p' NOT found in dex"
+              exit 1
+            fi
+            if unzip -p "$APK" 'classes*.dex' | strings | grep -q -F '.readersss p'; then
+              echo "ERROR: stale selector '.readersss p' still present in dex"
+              exit 1
+            fi
+            echo "OK: '#content p' present, '.readersss p' absent"
+          done
+
+      - name: Stage publish files
+        run: |
+          mkdir -p publish-out/apk publish-out/icon
+          cp build/repo/index.json publish-out/
+          cp build/repo/index.min.json publish-out/
+          cp build/repo/apk/*.apk publish-out/apk/
+          cp build/repo/icon/*.png publish-out/icon/ 2>/dev/null || echo "no icon extracted"
+          cat publish-out/index.min.json
+          echo "---"
+          ls -R publish-out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fixed-extension
+          path: publish-out
+          retention-days: 30
+
+  publish:
+    name: Publish to catalog repo
+    needs: build
+    if: ${{ inputs.catalog_repo != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: fixed-extension
+          path: publish-out
+
+      - name: Checkout catalog repo (branch repo)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.catalog_repo }}
+          ref: repo
+          path: catalog
+          token: ${{ secrets.BOT_PAT }}
+
+      - name: Merge index + copy files
+        run: |
+          python3 - <<'EOF'
+          import json, os, shutil, glob
+          cat_path = 'catalog/index.min.json'
+          existing = json.load(open(cat_path)) if os.path.exists(cat_path) else []
+          new = json.load(open('publish-out/index.min.json'))
+          by_pkg = {e['pkg']: e for e in existing}
+          for e in new:
+              by_pkg[e['pkg']] = e
+          merged = sorted(by_pkg.values(), key=lambda e: e['pkg'])
+          with open(cat_path, 'w') as f:
+              json.dump(merged, f, separators=(',', ':'))
+          with open('catalog/index.json', 'w') as f:
+              json.dump(merged, f, indent=2)
+          os.makedirs('catalog/apk', exist_ok=True)
+          os.makedirs('catalog/icon', exist_ok=True)
+          for src in glob.glob('publish-out/apk/*.apk'):
+              shutil.copy(src, 'catalog/apk/' + os.path.basename(src))
+          for src in glob.glob('publish-out/icon/*.png'):
+              shutil.copy(src, 'catalog/icon/' + os.path.basename(src))
+          print('catalog now has', len(merged), 'entries:')
+          for e in merged:
+              print(' -', e['name'], e['version'], 'code', e['code'], e['apk'])
+          EOF
+
+      - name: Commit + push
+        run: |
+          cd catalog
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -A
+          git status --short
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "Update IndoWebNovel to v2.3 (fixed content selector)"
+            git push
+          else
+            echo "No changes to commit"
+          fi
